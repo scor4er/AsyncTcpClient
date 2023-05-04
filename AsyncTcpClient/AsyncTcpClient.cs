@@ -9,6 +9,8 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Unclassified.Util;
 
 namespace Unclassified.Net
@@ -30,14 +32,12 @@ namespace Unclassified.Net
 		private TcpClient tcpClient;
 		private NetworkStream stream;
 		private TaskCompletionSource<bool> closedTcs = new TaskCompletionSource<bool>();
+		private ILogger logger;
 
 		#endregion Private data
 
 		#region Constructors
 
-		/// <summary>
-		/// Initialises a new instance of the <see cref="AsyncTcpClient"/> class.
-		/// </summary>
 		public AsyncTcpClient()
 		{
 			closedTcs.SetResult(true);
@@ -55,6 +55,15 @@ namespace Unclassified.Net
 		#endregion Events
 
 		#region Properties
+
+		/// <summary>
+		/// Default logger
+		/// </summary>
+		public ILogger Logger
+		{
+			get => logger ?? NullLogger.Instance;
+			set => logger = value;
+		}
 
 		/// <summary>
 		/// Gets or sets the <see cref="TcpClient"/> to use. Only for client connections that were
@@ -140,10 +149,22 @@ namespace Unclassified.Net
 		/// was closed by the remote host.
 		/// </summary>
 		/// <remarks>
-		/// This callback method may not be called when the <see cref="OnClosed"/> method is
+		/// This callback method may not be called when the <see cref="ClosingCallback"/> method is
 		/// overridden by a derived class.
 		/// </remarks>
-		public Action<AsyncTcpClient, bool> ClosedCallback { get; set; }
+		public Action<AsyncTcpClient, bool> ClosingCallback { get; set; }
+
+		/// <summary>
+		/// Called when the connection was closed. The parameter specifies whether the connection
+		/// was closed by the remote host. This method can implement the
+		/// communication logic to execute when the connection was established. The connection will
+		/// not be reopened before this method completes.
+		/// </summary>
+		/// <remarks>
+		/// This callback method may not be called when the <see cref="ClosedCallback"/> method is
+		/// overridden by a derived class.
+		/// </remarks>
+		public Func<AsyncTcpClient, Task> ClosedCallback { get; set; }
 
 		/// <summary>
 		/// Called when data was received from the remote host. The parameter specifies the number
@@ -172,14 +193,17 @@ namespace Unclassified.Net
 			do
 			{
 				reconnectTry++;
+				Log($"Enter RunAsync [reconnected:{isReconnected}], [trial:{reconnectTry}]");
 				ByteBuffer = new ByteBuffer();
 				if (ServerTcpClient != null)
 				{
+					Log("Take accepted connection from listener");
 					// Take accepted connection from listener
 					tcpClient = ServerTcpClient;
 				}
 				else
 				{
+					Log("Create tcp client");
 					// Try to connect to remote host
 					var connectTimeout = TimeSpan.FromTicks(ConnectTimeout.Ticks + (MaxConnectTimeout.Ticks - ConnectTimeout.Ticks) / 20 * Math.Min(reconnectTry, 20));
 					tcpClient = new TcpClient(AddressFamily.InterNetworkV6);
@@ -188,29 +212,36 @@ namespace Unclassified.Net
 					Task connectTask;
 					if (!string.IsNullOrWhiteSpace(HostName))
 					{
+						Log("Create connect task (host name)");
 						connectTask = tcpClient.ConnectAsync(HostName, Port);
 					}
 					else
 					{
+						Log("Create connect task");
 						connectTask = tcpClient.ConnectAsync(IPAddress, Port);
 					}
 					var timeoutTask = Task.Delay(connectTimeout);
+					Log("Await timeout and connect tasks");
 					if (await Task.WhenAny(connectTask, timeoutTask) == timeoutTask)
 					{
+						Log("Cannot connect - timeout was hit first");
 						Message?.Invoke(this, new AsyncTcpEventArgs("Connection timeout"));
 						continue;
 					}
 					try
 					{
+						Log("Await connect task");
 						await connectTask;
 					}
 					catch (Exception ex)
 					{
+						Log($"Connection exception! {ex}");
 						Message?.Invoke(this, new AsyncTcpEventArgs("Error connecting to remote host", ex));
 						await timeoutTask;
 						continue;
 					}
 				}
+				Log($"Get tcp client stream");
 				reconnectTry = -1;
 				stream = tcpClient.GetStream();
 
@@ -219,6 +250,8 @@ namespace Unclassified.Net
 				// permanently, not only when we might use received data.
 				var networkReadTask = Task.Run(async () =>
 				{
+					Log($"Establish read task");
+
 					// 10 KiB should be enough for every Ethernet packet
 					byte[] buffer = new byte[10240];
 					while (true)
@@ -226,6 +259,7 @@ namespace Unclassified.Net
 						int readLength;
 						try
 						{
+							Log($"Read async start");
 							readLength = await stream.ReadAsync(buffer, 0, buffer.Length);
 						}
 						catch (IOException ex) when ((ex.InnerException as SocketException)?.ErrorCode == (int)SocketError.OperationAborted ||
@@ -234,45 +268,72 @@ namespace Unclassified.Net
 							// Warning: This error code number (995) may change.
 							// See https://docs.microsoft.com/en-us/windows/desktop/winsock/windows-sockets-error-codes-2
 							// Note: NativeErrorCode and ErrorCode 125 observed on Linux.
+							Log($"Connection closed locally. Exception! {ex}");
 							Message?.Invoke(this, new AsyncTcpEventArgs("Connection closed locally", ex));
 							readLength = -1;
 						}
 						catch (IOException ex) when ((ex.InnerException as SocketException)?.ErrorCode == (int)SocketError.ConnectionAborted)
 						{
+							Log($"Connection aborted. Exception! {ex}");
 							Message?.Invoke(this, new AsyncTcpEventArgs("Connection aborted", ex));
 							readLength = -1;
 						}
 						catch (IOException ex) when ((ex.InnerException as SocketException)?.ErrorCode == (int)SocketError.ConnectionReset)
 						{
+							Log($"Connection reset remotely. Exception! {ex}");
 							Message?.Invoke(this, new AsyncTcpEventArgs("Connection reset remotely", ex));
 							readLength = -2;
 						}
 						if (readLength <= 0)
 						{
+							Log($"Close connection. Read length <= 0");
 							if (readLength == 0)
 							{
+								Log($"Close connection. Read length == 0");
 								Message?.Invoke(this, new AsyncTcpEventArgs("Connection closed remotely"));
 							}
 							closedTcs.TrySetResult(true);
-							OnClosed(readLength != -1);
+							OnClosing(readLength != -1);
+							Log($"Return from read async");
 							return;
 						}
+						Log($"Data read. Length > 0");
 						var segment = new ArraySegment<byte>(buffer, 0, readLength);
 						ByteBuffer.Enqueue(segment);
+						Log($"Something received. Segment queued. Report received data");
 						await OnReceivedAsync(readLength);
+						Log($"Received data reported");
 					}
 				});
 
 				closedTcs = new TaskCompletionSource<bool>();
+				Log($"Wait for established connection report");
 				await OnConnectedAsync(isReconnected);
+				Log($"Established connection reported");
 
 				// Wait for closed connection
+
+				Log($"Wait for closed connection");
 				await networkReadTask;
+				Log($"Close tcp client connection");
 				tcpClient.Close();
+				Log($"Connection closed");
+				await OnClosed();
 
 				isReconnected = true;
 			}
 			while (AutoReconnect && ServerTcpClient == null);
+		}
+
+		private void Log(string message)
+		{
+			int localPort = -1;
+			if (tcpClient?.Client?.Connected == true)
+			{
+				localPort = ((IPEndPoint)tcpClient.Client.LocalEndPoint).Port;
+			}
+
+			Logger.LogDebug($"{message} | thread: {Thread.CurrentThread.ManagedThreadId} | port: {localPort}");
 		}
 
 		/// <summary>
@@ -281,6 +342,7 @@ namespace Unclassified.Net
 		/// </summary>
 		public void Disconnect()
 		{
+			Log($"Tcp client disconnect request");
 			tcpClient.Client.Disconnect(false);
 		}
 
@@ -290,6 +352,7 @@ namespace Unclassified.Net
 		/// </summary>
 		public void Dispose()
 		{
+			Log($"Tcp client dispose request");
 			AutoReconnect = false;
 			tcpClient?.Dispose();
 			stream = null;
@@ -314,9 +377,12 @@ namespace Unclassified.Net
 		/// <returns>The task object representing the asynchronous operation.</returns>
 		public async Task Send(ArraySegment<byte> data, CancellationToken cancellationToken = default)
 		{
+			if (IsClosing)
+				throw new InvalidOperationException("Closing connection.");
 			if (!tcpClient.Client.Connected)
 				throw new InvalidOperationException("Not connected.");
 
+			Log($"Trying to send some data");
 			await stream.WriteAsync(data.Array, data.Offset, data.Count, cancellationToken);
 		}
 
@@ -342,13 +408,26 @@ namespace Unclassified.Net
 		}
 
 		/// <summary>
-		/// Called when the connection was closed.
+		/// Called when the connection dropped and close process started.
 		/// </summary>
 		/// <param name="remote">true, if the connection was closed by the remote host; false, if
 		///   the connection was closed locally.</param>
-		protected virtual void OnClosed(bool remote)
+		protected virtual void OnClosing(bool remote)
 		{
-			ClosedCallback?.Invoke(this, remote);
+			ClosingCallback?.Invoke(this, remote);
+		}
+
+		/// <summary>
+		/// Called when the connection was closed.
+		/// </summary>
+		protected virtual Task OnClosed()
+		{
+			if (ClosedCallback != null)
+			{
+				return ClosedCallback(this);
+			}
+
+			return Task.CompletedTask;
 		}
 
 		/// <summary>
